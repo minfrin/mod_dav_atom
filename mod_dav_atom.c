@@ -84,14 +84,12 @@ module AP_MODULE_DECLARE_DATA dav_atom_module;
 typedef struct
 {
     int dav_atom_set :1;
-    int doc_set :1;
     int stylesheet_set :1;
     int feed_id_set :1;
     int feed_link_set :1;
     int entry_id_set :1;
     int entry_link_set :1;
     int dav_atom;
-    apr_xml_doc *doc;
     ap_expr_info_t *stylesheet;
     ap_expr_info_t *feed_id;
     ap_expr_info_t *feed_link;
@@ -127,9 +125,6 @@ static void *merge_dav_atom_dir_config(apr_pool_t *p, void *basev, void *addv)
     new->dav_atom = (add->dav_atom_set == 0) ? base->dav_atom : add->dav_atom;
     new->dav_atom_set = add->dav_atom_set || base->dav_atom_set;
 
-    new->doc = (add->doc_set == 0) ? base->doc : add->doc;
-    new->doc_set = add->doc_set || base->doc_set;
-
     new->stylesheet = (add->stylesheet_set == 0) ? base->stylesheet : add->stylesheet;
     new->stylesheet_set = add->stylesheet_set || base->stylesheet_set;
 
@@ -154,58 +149,6 @@ static const char *set_dav_atom(cmd_parms *cmd, void *dconf, int flag)
 
     conf->dav_atom = flag;
     conf->dav_atom_set = 1;
-
-    return NULL;
-}
-
-static const char *add_dav_atom_property(cmd_parms *cmd, void *dconf, const char *namespace, const char *name)
-{
-    dav_atom_config_rec *conf = dconf;
-    apr_xml_elem *prop, *elem;
-
-    if (!conf->doc) {
-
-        apr_xml_doc *doc;
-        apr_xml_elem *propfind;
-
-        doc = apr_palloc(cmd->pool, sizeof(apr_xml_doc));
-        doc->namespaces = apr_array_make(cmd->pool, 5, sizeof(const char *));
-        apr_xml_insert_uri(doc->namespaces, DAV_XML_NAMESPACE);
-
-        propfind = doc->root = apr_pcalloc(cmd->pool, sizeof(apr_xml_elem));
-        propfind->name = "propfind";
-
-        prop = apr_pcalloc(cmd->pool, sizeof(apr_xml_elem));
-        prop->name = "prop";
-        doc->root->first_child = doc->root->last_child = prop;
-
-        conf->doc = doc;
-    }
-
-    prop = conf->doc->root->first_child;
-
-    elem = apr_pcalloc(cmd->pool, sizeof(apr_xml_elem));
-    if (name) {
-        elem->name = name;
-        elem->ns = apr_xml_insert_uri(conf->doc->namespaces,
-                        namespace);
-    }
-    else {
-        elem->name = namespace;
-    }
-
-    /* set up the child/sibling links */
-    if (prop->last_child == NULL) {
-        /* no first child either */
-        prop->first_child = prop->last_child = elem;
-    }
-    else {
-        /* hook onto the end of the parent's children */
-        prop->last_child->next = elem;
-        prop->last_child = elem;
-    }
-
-    conf->doc_set = 1;
 
     return NULL;
 }
@@ -310,8 +253,6 @@ static const command_rec dav_atom_cmds[] =
     AP_INIT_FLAG("DavAtom",
         set_dav_atom, NULL, RSRC_CONF | ACCESS_CONF,
         "When enabled, the URL space will return Atom feeds."),
-    AP_INIT_TAKE12("DavAtomProperty", add_dav_atom_property, NULL, RSRC_CONF | ACCESS_CONF,
-        "Set the property namespace and name to map to the atom feed."),
     AP_INIT_TAKE1("DavAtomStylesheet", set_dav_atom_stylesheet, NULL, RSRC_CONF | ACCESS_CONF,
         "Set the XSLT stylesheet to be used when rendering the output."),
     AP_INIT_TAKE1("DavAtomFeedId", set_dav_atom_feed_id, NULL, ACCESS_CONF,
