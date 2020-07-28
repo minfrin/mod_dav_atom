@@ -25,12 +25,6 @@
  * application/atom+xml, an atom:feed is generated containing a single
  * entry for each resource in the collection.
  *
- * If a GET is made on a resource, and the requested content type is
- * application/atom+xml, an atom:entry is generated containing the single
- * entry corresponding to the resource.
- *
- * *** DavAtomAlias / DavAtomAliasMatch ??? ***
- *
  * The elements of the Atom feed are read from the WebDAV properties of the
  * resources. Further modules can be used to inspect resources to generate
  * live properties.
@@ -44,10 +38,12 @@
  *   Dav on
  *   DavAtom on
  *
- *   # map an atom property to a webdav property, or set to a given string
- *   DavAtomProperty summary displayname
- *   DavAtomProperty urn:ietf:params:xml:ns:caldav calendar-timezone
+ *   # if properties cannot be found in webdav, generate them as follows:
  *   DavAtomStylesheet atom.xsl
+ *   DavAtomFeedId https://www.example.com%{REQUEST_URI}
+ *   DavAtomFeedLink https://www.example.com%{REQUEST_URI}
+ *   DavAtomEntryId https://www.example.com%{REQUEST_URI}
+ *
  * </Location>
  *
  */
@@ -91,12 +87,16 @@ typedef struct
     int doc_set :1;
     int stylesheet_set :1;
     int feed_id_set :1;
+    int feed_link_set :1;
     int entry_id_set :1;
+    int entry_link_set :1;
     int dav_atom;
     apr_xml_doc *doc;
     ap_expr_info_t *stylesheet;
     ap_expr_info_t *feed_id;
+    ap_expr_info_t *feed_link;
     ap_expr_info_t *entry_id;
+    ap_expr_info_t *entry_link;
 } dav_atom_config_rec;
 
 typedef struct dav_atom_ctx {
@@ -136,8 +136,14 @@ static void *merge_dav_atom_dir_config(apr_pool_t *p, void *basev, void *addv)
     new->feed_id = (add->feed_id_set == 0) ? base->feed_id : add->feed_id;
     new->feed_id_set = add->feed_id_set || base->feed_id_set;
 
+    new->feed_link = (add->feed_link_set == 0) ? base->feed_link : add->feed_link;
+    new->feed_link_set = add->feed_link_set || base->feed_link_set;
+
     new->entry_id = (add->entry_id_set == 0) ? base->entry_id : add->entry_id;
     new->entry_id_set = add->entry_id_set || base->entry_id_set;
+
+    new->entry_link = (add->entry_link_set == 0) ? base->entry_link : add->entry_link;
+    new->entry_link_set = add->entry_link_set || base->entry_link_set;
 
     return new;
 }
@@ -242,6 +248,25 @@ static const char *set_dav_atom_feed_id(cmd_parms *cmd, void *dconf, const char 
     return NULL;
 }
 
+static const char *set_dav_atom_feed_link(cmd_parms *cmd, void *dconf, const char *link)
+{
+    dav_atom_config_rec *conf = dconf;
+    const char *expr_err = NULL;
+
+    conf->feed_link = ap_expr_parse_cmd(cmd, link, AP_EXPR_FLAG_STRING_RESULT,
+            &expr_err, NULL);
+
+    if (expr_err) {
+        return apr_pstrcat(cmd->temp_pool,
+                "Cannot parse expression '", link, "': ",
+                expr_err, NULL);
+    }
+
+    conf->feed_link_set = 1;
+
+    return NULL;
+}
+
 static const char *set_dav_atom_entry_id(cmd_parms *cmd, void *dconf, const char *id)
 {
     dav_atom_config_rec *conf = dconf;
@@ -261,6 +286,25 @@ static const char *set_dav_atom_entry_id(cmd_parms *cmd, void *dconf, const char
     return NULL;
 }
 
+static const char *set_dav_atom_entry_link(cmd_parms *cmd, void *dconf, const char *link)
+{
+    dav_atom_config_rec *conf = dconf;
+    const char *expr_err = NULL;
+
+    conf->entry_link = ap_expr_parse_cmd(cmd, link, AP_EXPR_FLAG_STRING_RESULT,
+            &expr_err, NULL);
+
+    if (expr_err) {
+        return apr_pstrcat(cmd->temp_pool,
+                "Cannot parse expression '", link, "': ",
+                expr_err, NULL);
+    }
+
+    conf->entry_link_set = 1;
+
+    return NULL;
+}
+
 static const command_rec dav_atom_cmds[] =
 {
     AP_INIT_FLAG("DavAtom",
@@ -272,8 +316,12 @@ static const command_rec dav_atom_cmds[] =
         "Set the XSLT stylesheet to be used when rendering the output."),
     AP_INIT_TAKE1("DavAtomFeedId", set_dav_atom_feed_id, NULL, ACCESS_CONF,
         "Set the ID of the feed to a given value. Overridden by ID in atom:feed WebDAV property."),
+    AP_INIT_TAKE1("DavAtomFeedLink", set_dav_atom_feed_link, NULL, ACCESS_CONF,
+        "Set the link of the feed to a given value. Overridden by link in atom:feed WebDAV property."),
     AP_INIT_TAKE1("DavAtomEntryId", set_dav_atom_entry_id, NULL, ACCESS_CONF,
         "Set the ID of the entry to a given value. Overridden by ID in atom:entry WebDAV property."),
+    AP_INIT_TAKE1("DavAtomEntryLink", set_dav_atom_entry_link, NULL, ACCESS_CONF,
+        "Set the link of the entry to a given value. Overridden by link in atom:entry WebDAV property."),
     { NULL }
 };
 
@@ -350,6 +398,25 @@ static apr_xml_elem *dav_add_child_ns(apr_pool_t *p, apr_xml_elem *elem,
     }
 
     return child;
+}
+
+static apr_xml_attr *dav_add_attr_ns(apr_pool_t *p, apr_xml_elem *elem,
+                                     int ns, const char *tagname,
+                                     const char *value)
+{
+    apr_xml_attr *attr;
+
+    /* add the id element */
+    attr = apr_pcalloc(p, sizeof(apr_xml_attr));
+    attr->name = tagname;
+    attr->ns = ns;
+
+    attr->value = value;
+
+    attr->next = elem->attr;
+    elem->attr = attr;
+
+    return attr;
 }
 
 static int dav_atom_type_checker(request_rec *r)
@@ -556,45 +623,6 @@ static dav_error *dav_atom_get_parsed_props(apr_pool_t *p,
     return NULL;
 }
 
-static void dav_atom_parse_config(apr_pool_t *p, request_rec *r, const char **feed_id,
-         const char **entry_id)
-{
-    dav_atom_config_rec *conf = ap_get_module_config(r->per_dir_config,
-            &dav_atom_module);
-
-    if (conf->feed_id) {
-        const char *err = NULL;
-
-        *feed_id = apr_pstrdup(p, ap_expr_str_exec(r, conf->feed_id, &err));
-        if (err) {
-            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
-                            "Failure while evaluating the feed ID expression for '%s', "
-                            "feed ID ignored: %s", r->uri, err);
-        }
-
-    }
-    else {
-        *feed_id = apr_pstrcat(p, "https://",
-                r->server->server_hostname ? r->server->server_hostname : "", r->uri, NULL);
-    }
-
-    if (conf->entry_id) {
-        const char *err = NULL;
-
-        *entry_id = apr_pstrdup(p, ap_expr_str_exec(r, conf->entry_id, &err));
-        if (err) {
-            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
-                            "Failure while evaluating the entry ID expression for '%s', "
-                            "feed ID ignored: %s", r->uri, err);
-        }
-
-    }
-    else {
-        *entry_id = apr_pstrcat(p, "https://",
-                r->server->server_hostname ? r->server->server_hostname : "", r->uri, NULL);
-    }
-}
-
 static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
 {
     dav_atom_ctx *ctx = wres->walk_ctx;
@@ -606,7 +634,13 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
     apr_xml_parser *parser;
     const char *buf;
 
-    const char *feed_id = NULL, *entry_id = NULL;
+    const char *feed_id = NULL, *entry_id = NULL, *feed_link = NULL, *entry_link = NULL;
+
+    /* skip any resource whose name starts with a dot */
+    if (strstr(wres->resource->uri, "/.")) {
+        apr_pool_clear(ctx->scratchpool);
+        return NULL;
+    }
 
     /* check for any method preconditions */
     if (dav_run_method_precondition(ctx->r, NULL, wres->resource, NULL, &err) != DECLINED
@@ -617,7 +651,44 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
 
     /* first collection resource? */
     if (ctx->count == 0) {
-        dav_atom_parse_config(ctx->scratchpool, ctx->r, &feed_id, &entry_id);
+
+        dav_atom_config_rec *conf = ap_get_module_config(ctx->r->per_dir_config,
+                &dav_atom_module);
+
+        if (conf->feed_id) {
+            const char *err = NULL;
+
+            feed_id = apr_pstrdup(ctx->scratchpool, ap_expr_str_exec(ctx->r, conf->feed_id, &err));
+            if (err) {
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, ctx->r,
+                                "Failure while evaluating the feed ID expression for '%s', "
+                                "feed ID ignored: %s", ctx->r->uri, err);
+            }
+
+        }
+        else {
+            feed_id = apr_pstrcat(ctx->scratchpool, "https://",
+                    ctx->r->server->server_hostname ?
+                            ctx->r->server->server_hostname : "", ctx->r->uri, NULL);
+        }
+
+        if (conf->feed_link) {
+            const char *err = NULL;
+
+            feed_link = apr_pstrdup(ctx->scratchpool, ap_expr_str_exec(ctx->r, conf->feed_link, &err));
+            if (err) {
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, ctx->r,
+                                "Failure while evaluating the feed link expression for '%s', "
+                                "feed link ignored: %s", ctx->r->uri, err);
+            }
+
+        }
+        else {
+            feed_link = apr_pstrcat(ctx->scratchpool, "https://",
+                    ctx->r->server->server_hostname ?
+                            ctx->r->server->server_hostname : "", ctx->r->uri, NULL);
+        }
+
     }
     else {
 
@@ -634,7 +705,44 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
             return NULL;
         }
         else {
-            dav_atom_parse_config(ctx->scratchpool, rr, &feed_id, &entry_id);
+
+            dav_atom_config_rec *conf = ap_get_module_config(rr->per_dir_config,
+                    &dav_atom_module);
+
+            if (conf->entry_id) {
+                const char *err = NULL;
+
+                entry_id = apr_pstrdup(ctx->scratchpool,
+                        ap_expr_str_exec(rr, conf->entry_id, &err));
+                if (err) {
+                    ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, rr,
+                                    "Failure while evaluating the entry ID expression for '%s', "
+                                    "feed ID ignored: %s", rr->uri, err);
+                }
+
+            }
+            else {
+                entry_id = apr_pstrcat(ctx->scratchpool, "https://",
+                        rr->server->server_hostname ? rr->server->server_hostname : "", rr->uri, NULL);
+            }
+
+            if (conf->entry_link) {
+                const char *err = NULL;
+
+                entry_link = apr_pstrdup(ctx->scratchpool,
+                        ap_expr_str_exec(rr, conf->entry_link, &err));
+                if (err) {
+                    ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, rr,
+                                    "Failure while evaluating the entry link expression for '%s', "
+                                    "entry ID ignored: %s", rr->uri, err);
+                }
+
+            }
+            else {
+                entry_link = apr_pstrcat(ctx->scratchpool, "https://",
+                        rr->server->server_hostname ? rr->server->server_hostname : "", rr->uri, NULL);
+            }
+
         }
         ap_destroy_sub_req(rr);
     }
@@ -647,6 +755,8 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
               "<A:feed xmlns:A=\"" DAV_ATOM_XML_NAMESPACE "\"/>"
               "<A:entry xmlns:A=\"" DAV_ATOM_XML_NAMESPACE "\"/>"
               "<D:displayname/>"
+              "<D:getcontenttype/>"
+              "<D:getcontentlength/>"
               "<D:getlastmodified/>"
             "</D:prop>"
           "</D:propfind>";
@@ -668,7 +778,7 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
 
     if (propdb) {
         apr_xml_elem *propstat, *prop, *feed, *entry, *title, *updated, *displayname,
-            *lastmodified;
+            *lastmodified, *link, *id, *contenttype, *contentlength;
         dav_get_props_result result = { 0 };
 
         result = dav_get_props(propdb, propfind);
@@ -697,6 +807,8 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
         if (!err) {
 
             displayname = dav_find_child(prop, "displayname");
+            contentlength = dav_find_child(prop, "getcontentlength");
+            contenttype = dav_find_child(prop, "getcontenttype");
             lastmodified = dav_find_child(prop, "getlastmodified");
 
             /*
@@ -715,17 +827,25 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
                             NULL);
                 }
 
-                if (feed_id && !dav_find_child_ns(feed, ctx->ns, "id")) {
-                    dav_remove_child_ns(feed, ctx->ns, "id");
+                id = dav_find_child_ns(feed, ctx->ns, "id");
+                if (!id) {
 
-                    /* add the id element */
-                    dav_add_child_ns(ctx->scratchpool, feed, ctx->ns, "id", feed_id,
-                            NULL);
+                    /* set the ID of the feed */
+                    if (feed_id) {
+                        dav_remove_child_ns(feed, ctx->ns, "id");
 
+                        /* add the id element */
+                        dav_add_child_ns(ctx->scratchpool, feed, ctx->ns, "id", feed_id,
+                                NULL);
+                    }
+                    else {
+                        err = dav_new_error(ctx->r->pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
+                                "No 'id' element in atom:feed, this feed is invalid.");
+                    }
                 }
 
                 /* make sure we have a atom:title */
-                title = dav_find_child_ns(prop, ctx->ns, "title");
+                title = dav_find_child_ns(feed, ctx->ns, "title");
                 if (!title) {
 
                     /* set the title to the displayname, failing that the uri */
@@ -741,7 +861,7 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
                 }
 
                 /* make sure we have a atom:updated */
-                updated = dav_find_child_ns(prop, ctx->ns, "updated");
+                updated = dav_find_child_ns(feed, ctx->ns, "updated");
                 if (!updated && lastmodified->first_cdata.first->text) {
 
                     apr_time_t lm = apr_date_parse_http(
@@ -760,14 +880,30 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
 
                 }
 
-                dav_begin_atom_feed(ctx, ctx->r, HTTP_OK, feed,
-                        response->namespaces);
+                /* make sure we have a atom:link */
+                link = dav_find_child_ns(feed, ctx->ns, "link");
+                if (!link) {
+                    link = dav_add_child_ns(ctx->scratchpool, feed, ctx->ns, "link",
+                            NULL, NULL);
+
+                    dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "rel",
+                            "self");
+                    dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "href",
+                            feed_link);
+                }
+
+                if (!err) {
+                    dav_begin_atom_feed(ctx, ctx->r, HTTP_OK, feed,
+                            response->namespaces);
+
+                    ctx->count++;
+                }
             }
 
             /*
              * Is this a subsequent resource?
              *
-             * If so, these will be the entries. Send the
+             * If so, these will be the entries.
              */
             else {
 
@@ -777,17 +913,20 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
                             NULL);
                 }
 
-                if (entry_id && !dav_find_child_ns(entry, ctx->ns, "id")) {
+                if (entry_id) {
                     dav_remove_child_ns(entry, ctx->ns, "id");
 
                     /* add the id element */
                     dav_add_child_ns(ctx->scratchpool, entry, ctx->ns, "id", entry_id,
                             NULL);
-
+                }
+                else {
+                    err = dav_new_error(ctx->r->pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
+                            "No 'id' element in atom:entry, this feed is invalid.");
                 }
 
                 /* make sure we have a atom:title */
-                title = dav_find_child_ns(prop, ctx->ns, "title");
+                title = dav_find_child_ns(entry, ctx->ns, "title");
                 if (!title) {
 
                     /* set the title to the displayname, failing that the uri */
@@ -803,7 +942,7 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
                 }
 
                 /* make sure we have a atom:updated */
-                updated = dav_find_child_ns(prop, ctx->ns, "updated");
+                updated = dav_find_child_ns(entry, ctx->ns, "updated");
                 if (!updated) {
 
                     apr_time_t lm = apr_date_parse_http(
@@ -822,10 +961,39 @@ static dav_error * dav_atom_get_walker(dav_walk_resource *wres, int calltype)
 
                 }
 
-                dav_send_atom_entry(ctx, ctx->r, entry, response->namespaces);
+                /* make sure we have a atom:link */
+                link = dav_find_child_ns(entry, ctx->ns, "link");
+                if (!link) {
+                    link = dav_add_child_ns(ctx->scratchpool, entry, ctx->ns, "link",
+                            NULL, NULL);
+
+                    if (contenttype && contenttype->first_cdata.first->text
+                    		&& !strncmp(contenttype->first_cdata.first->text, "text/",
+                    				5)) {
+                        dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "rel",
+                                "alternate");
+                    }
+                    else {
+                        dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "rel",
+                                "enclosure");
+                        dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "type",
+                        		contenttype->first_cdata.first->text);
+                        if (contentlength && contentlength->first_cdata.first->text) {
+                            dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "length",
+                            		contentlength->first_cdata.first->text);
+                        }
+                    }
+                    dav_add_attr_ns(ctx->scratchpool, link, ctx->ns, "href",
+                            entry_link);
+                }
+
+                if (!err) {
+                    dav_send_atom_entry(ctx, ctx->r, entry, response->namespaces);
+
+                    ctx->count++;
+                }
             }
 
-            ctx->count++;
         }
 
 
